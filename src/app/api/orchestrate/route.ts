@@ -26,6 +26,77 @@ const BREAKER_COOLDOWN_MS = 30_000; // how long the breaker stays open
 let consecutiveFailures = 0;
 let breakerOpenUntil = 0;
 
+// ==========================================
+// EVALUATION HOOKS (inactive unless EVAL_MODE=1)
+// ==========================================
+// Used only by scripts/eval to run ablation and fault-injection experiments.
+// With EVAL_MODE unset, every x-eval-* header and eval_transcript field is ignored.
+const EVAL_MODE = process.env.EVAL_MODE === '1';
+
+type AblationFlag = 'normalizer' | 'labellock' | 'fallback' | 'whitelist';
+type FaultMode = 'none' | 'timeout' | 'error' | 'malformed' | 'hallucinate';
+
+type EvalOptions = {
+  enabled: boolean;
+  ablate: Set<AblationFlag>;
+  fault: FaultMode;
+  transcript: string | null;
+};
+
+const ABLATION_FLAGS: readonly AblationFlag[] = ['normalizer', 'labellock', 'fallback', 'whitelist'];
+const FAULT_MODES: readonly FaultMode[] = ['none', 'timeout', 'error', 'malformed', 'hallucinate'];
+const HALLUCINATED_ROUTE = "/services/apply-new-ration-card-online";
+
+function readEvalOptions(request: Request, formData: FormData): EvalOptions {
+  const off: EvalOptions = { enabled: false, ablate: new Set(), fault: 'none', transcript: null };
+  if (!EVAL_MODE) return off;
+
+  if (request.headers.get('x-eval-reset-breaker') === '1') {
+    consecutiveFailures = 0;
+    breakerOpenUntil = 0;
+  }
+
+  const ablate = new Set<AblationFlag>();
+  for (const part of (request.headers.get('x-eval-ablate') ?? '').split(',')) {
+    const flag = part.trim().toLowerCase();
+    const known = ABLATION_FLAGS.find((f) => f === flag);
+    if (known) ablate.add(known);
+  }
+
+  const faultHeader = (request.headers.get('x-eval-fault') ?? 'none').trim().toLowerCase();
+  const fault = FAULT_MODES.find((f) => f === faultHeader) ?? 'none';
+
+  const t = formData.get('eval_transcript');
+  const transcript = typeof t === 'string' && t.trim() !== '' ? t : null;
+
+  return { enabled: true, ablate, fault, transcript };
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// Detects numeric PII in what is about to be sent to the LLM: raw vault values,
+// any remaining run of 6+ digits, or a run of 4+ spelled-out digit words.
+const SPOKEN_DIGIT = "(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)";
+const SPOKEN_DIGIT_RUN = new RegExp(`\\b${SPOKEN_DIGIT}(?:[\\s,.-]+${SPOKEN_DIGIT}){3,}\\b`, 'i');
+
+function detectPiiLeak(
+  messages: { role: string; content: string }[],
+  vault: Map<string, string>
+): boolean {
+  const payload = messages
+    .filter((m) => m.role !== 'system')
+    .map((m) => m.content)
+    .join('\n');
+  const payloadDigits = payload.replace(/\D/g, ' ');
+
+  for (const raw of vault.values()) {
+    const digits = raw.replace(/\D/g, '');
+    if (payload.includes(raw) || (digits.length >= 6 && payloadDigits.includes(digits))) return true;
+  }
+  if (/\d(?:[-.,\s]{0,2}\d){5,}/.test(payload)) return true;
+  return SPOKEN_DIGIT_RUN.test(payload);
+}
+
 type AiResponse = {
   type: string;
   target: string;
@@ -100,6 +171,32 @@ SCENARIO 3: Factual Q&A (type "qa", target "none").
 // ==========================================
 // HELPERS
 // ==========================================
+
+// Acoustic Normalizer:
+// 1. Spoken repeat expansion: "double five" -> "55", "triple zero" -> "000"
+// 2. Spelled-out digit runs: "nine eight three three ..." -> "9833..." (4+ consecutive digit tokens only,
+//    so ordinary phrases like "one ration card" are left alone). Without this step, numbers that
+//    Whisper writes as words would slip past maskPII and reach the LLM unmasked.
+const DIGIT_WORDS: Record<string, string> = {
+  zero: "0", oh: "0", one: "1", two: "2", three: "3", four: "4",
+  five: "5", six: "6", seven: "7", eight: "8", nine: "9",
+};
+
+function normalizeAcoustics(text: string): string {
+  const expanded = text.replace(/(double|triple)\s*([a-z]+|\d)/gi, (match: string, modifier: string, val: string) => {
+    const digit = DIGIT_WORDS[val.toLowerCase()] ?? val;
+    if (!/^\d$/.test(digit)) return match;
+    return modifier.toLowerCase() === 'double' ? digit.repeat(2) : digit.repeat(3);
+  });
+
+  const token = "(?:zero|oh|one|two|three|four|five|six|seven|eight|nine|\\d+)";
+  const run = new RegExp(`\\b${token}(?:[\\s,.-]+${token}){3,}\\b`, 'gi');
+  return expanded.replace(run, (match: string) => {
+    const parts = match.split(/[\s,.-]+/).filter(Boolean);
+    if (!parts.some((p) => /^[a-z]+$/i.test(p))) return match; // pure digit runs are already maskable
+    return parts.map((p) => DIGIT_WORDS[p.toLowerCase()] ?? p).join('');
+  });
+}
 
 // PII Privacy Shield: masks any 6–13 digit sequence with a neutral token so length never misleads slot mapping
 function maskPII(text: string, vault: Map<string, string>): string {
@@ -185,7 +282,7 @@ function extractLabeledEntities(
 }
 
 // Client-supplied history is untrusted: whitelist roles, cap size, mask PII
-function sanitizeHistory(raw: unknown, vault: Map<string, string>) {
+function sanitizeHistory(raw: unknown, vault: Map<string, string>, normalize = true) {
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((m): m is { role: "user" | "assistant"; content: string } => {
@@ -199,7 +296,7 @@ function sanitizeHistory(raw: unknown, vault: Map<string, string>) {
     .slice(-6)
     .map((m) => ({
       role: m.role,
-      content: maskPII(m.content.slice(0, 500), vault),
+      content: maskPII(normalize ? normalizeAcoustics(m.content.slice(0, 500)) : m.content.slice(0, 500), vault),
     }));
 }
 
@@ -219,20 +316,30 @@ function keywordRouter(text: string): AiResponse | null {
     entities: {},
   });
 
-  if (/helpline|toll|contact|call/.test(t)) return qa("The toll-free helpline is 1800-345-5505 or 1967.");
-  if (/hour|timing|open|close/.test(t)) return qa("Office hours are Monday to Friday, 10 AM to 5:30 PM. Closed on weekends.");
-  if (/address|office|where|located|head/.test(t)) return qa("The head office is at Khadya Bhavan, 11A Mirza Ghalib Street, Kolkata.");
+  // Q&A patterns are checked first but are deliberately narrow, so navigation phrases such as
+  // "open the status page", "where is my application status" or "my contact number is ..." are not captured.
+  if (/\b(helpline|toll[- ]?free|customer care|support number)\b|\b(whom|who) (do i|should i|can i) call\b/.test(t)) {
+    return qa("The toll-free helpline is 1800-345-5505 or 1967.");
+  }
+  if (/\b(office hours?|working hours?|opening hours?|timings?)\b|\bwhen (is|does) (the )?office (open|close)\b|\b(is|are) (the )?office (open|closed)\b/.test(t)) {
+    return qa("Office hours are Monday to Friday, 10 AM to 5:30 PM. Closed on weekends.");
+  }
+  if (/\b(address|head office|khadya bhavan)\b|\bwhere is (the )?(food|office|department)\b|\boffice (is )?located\b/.test(t)) {
+    return qa("The head office is at Khadya Bhavan, 11A Mirza Ghalib Street, Kolkata.");
+  }
 
-  if (/(apply|new|make|get).*(ration|card)|ration.*(apply|new|make)/.test(t)) return nav("/services/apply-ration");
-  if (/aadhaar|aadhar|adhar|link/.test(t)) return nav("/services/link-aadhaar");
-  if (/status|track|check/.test(t)) return nav("/services/status");
+  // "status"/"track" wins over "get ... ration card" so "get the status of my ration card" is not routed to apply
+  if (/\b(status|track|tracking)\b/.test(t)) return nav("/services/status");
+  if (/\b(apply|new|make|get)\b.*\b(ration|card)\b|\bration\b.*\b(apply|new|make)\b/.test(t)) return nav("/services/apply-ration");
+  if (/\b(aadhaar|aadhar|adhar|link|seed|seeding|e-?kyc)\b/.test(t)) return nav("/services/link-aadhaar");
+  if (/\bcheck\b/.test(t)) return nav("/services/status");
   if (/ration card services|services/.test(t)) return nav("/services/ration-card");
   if (/home|dashboard|main page/.test(t)) return nav("/");
   return null;
 }
 
 // Glitch-Catcher: strict JSON first, deterministic regex extraction second
-function parseLLMOutput(content: string): { response: AiResponse; parseOk: boolean } {
+function parseLLMOutput(content: string, allowRegex = true): { response: AiResponse | null; parseOk: boolean } {
   const base: AiResponse = {
     type: "unknown",
     target: "none",
@@ -253,6 +360,7 @@ function parseLLMOutput(content: string): { response: AiResponse; parseOk: boole
     base.entities = parsed.entities && typeof parsed.entities === 'object' ? parsed.entities : {};
     return { response: base, parseOk: true };
   } catch {
+    if (!allowRegex) return { response: null, parseOk: false };
     console.error("JSON Parsing Failed. Falling back to Regex.");
     const typeMatch = content.match(/"type"\s*:\s*"?([^",\n}]+)"?/i);
     const targetMatch = content.match(/"target"\s*:\s*"?([^",\n}]+)"?/i);
@@ -295,7 +403,7 @@ async function logTelemetry(row: (string | number | boolean)[]) {
     if (!existsSync(file)) {
       await appendFile(
         file,
-        'timestamp,whisper_ms,llm_ms,total_ms,source,parse_ok,breaker,type,final_route,pii_count\n'
+        'timestamp,whisper_ms,llm_ms,total_ms,source,parse_ok,breaker,type,final_route,pii_count,pii_leak,mode\n'
       );
     }
     await appendFile(file, row.join(',') + '\n');
@@ -310,9 +418,13 @@ async function logTelemetry(row: (string | number | boolean)[]) {
 export async function POST(request: Request) {
   try {
     const formData = await request.formData();
-    const audioFile = formData.get('file') as Blob;
+    const evalOpts = readEvalOptions(request, formData);
+    const ablated = (flag: AblationFlag) => evalOpts.ablate.has(flag);
 
-    if (!audioFile || audioFile.size < MIN_AUDIO_BYTES) {
+    const audioFile = formData.get('file') as Blob | null;
+    const usingEvalTranscript = evalOpts.transcript !== null;
+
+    if (!usingEvalTranscript && (!audioFile || audioFile.size < MIN_AUDIO_BYTES)) {
       return NextResponse.json({ error: "Empty or too-short audio file" }, { status: 400 });
     }
 
@@ -325,53 +437,59 @@ export async function POST(request: Request) {
     } catch {
       rawHistory = [];
     }
-    const history = sanitizeHistory(rawHistory, piiVault);
+    const history = sanitizeHistory(rawHistory, piiVault, !ablated('normalizer'));
 
     const t0 = performance.now();
+    let transcript: string;
 
-    const fileBuffer = await audioFile.arrayBuffer();
-    const cleanBlob = new Blob([fileBuffer], { type: 'audio/webm' });
+    if (usingEvalTranscript) {
+      // Text-only evaluation: skips ASR so the reasoning stage can be measured on fixed transcripts
+      transcript = evalOpts.transcript ?? "";
+    } else {
+      const fileBuffer = await (audioFile as Blob).arrayBuffer();
+      const cleanBlob = new Blob([fileBuffer], { type: 'audio/webm' });
 
-    // ==========================================
-    // PHASE 1: THE EARS (Groq Whisper Translations)
-    // ==========================================
-    const groqFormData = new FormData();
-    groqFormData.append('file', cleanBlob, 'audio.webm');
-    groqFormData.append('model', 'whisper-large-v3');
-    groqFormData.append('response_format', 'json');
+      // ==========================================
+      // PHASE 1: THE EARS (Groq Whisper Translations)
+      // ==========================================
+      const groqFormData = new FormData();
+      groqFormData.append('file', cleanBlob, 'audio.webm');
+      groqFormData.append('model', 'whisper-large-v3');
+      groqFormData.append('response_format', 'json');
 
-    const whisperController = new AbortController();
-    const whisperTimer = setTimeout(() => whisperController.abort(), WHISPER_TIMEOUT_MS);
-    let groqResponse: Response;
+      const whisperController = new AbortController();
+      const whisperTimer = setTimeout(() => whisperController.abort(), WHISPER_TIMEOUT_MS);
+      let groqResponse: Response;
 
-    try {
-      groqResponse = await fetch('https://api.groq.com/openai/v1/audio/translations', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-        body: groqFormData,
-        signal: whisperController.signal,
-      });
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        console.error(`[Groq Audio API Error] Timed out after ${WHISPER_TIMEOUT_MS}ms`);
-        return NextResponse.json({ error: "Groq Audio API Timed Out" }, { status: 504 });
+      try {
+        groqResponse = await fetch('https://api.groq.com/openai/v1/audio/translations', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+          body: groqFormData,
+          signal: whisperController.signal,
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          console.error(`[Groq Audio API Error] Timed out after ${WHISPER_TIMEOUT_MS}ms`);
+          return NextResponse.json({ error: "Groq Audio API Timed Out" }, { status: 504 });
+        }
+        throw err;
+      } finally {
+        clearTimeout(whisperTimer);
       }
-      throw err;
-    } finally {
-      clearTimeout(whisperTimer);
-    }
 
-    if (!groqResponse.ok) {
-      const errorText = await groqResponse.text();
-      console.error(`[Groq Audio API Error] Status: ${groqResponse.status}`);
-      return new Response(
-        JSON.stringify({ error: "Groq Audio API Failed", details: errorText }),
-        { status: groqResponse.status, headers: { "Content-Type": "application/json" } }
-      );
-    }
+      if (!groqResponse.ok) {
+        const errorText = await groqResponse.text();
+        console.error(`[Groq Audio API Error] Status: ${groqResponse.status}`);
+        return new Response(
+          JSON.stringify({ error: "Groq Audio API Failed", details: errorText }),
+          { status: groqResponse.status, headers: { "Content-Type": "application/json" } }
+        );
+      }
 
-    const groqData = await groqResponse.json();
-    const transcript: string = groqData.text;
+      const groqData: { text?: string } = await groqResponse.json();
+      transcript = groqData.text ?? "";
+    }
 
     if (!transcript || transcript.trim() === "") {
       return NextResponse.json({ transcript: "", target: "unknown" });
@@ -380,18 +498,9 @@ export async function POST(request: Request) {
     const t1 = performance.now();
 
     // ==========================================
-    // ACOUSTIC NORMALIZER ("double five" -> "55")
+    // ACOUSTIC NORMALIZER ("double five" -> "55", spelled-out digit runs -> digits)
     // ==========================================
-    const digitMap: Record<string, string> = {
-      zero: "0", one: "1", two: "2", three: "3", four: "4",
-      five: "5", six: "6", seven: "7", eight: "8", nine: "9",
-    };
-
-    let safeTranscript = transcript.replace(/(double|triple)\s*([a-z]+|\d)/gi, (match, modifier, val) => {
-      const digit = digitMap[val.toLowerCase()] || val;
-      if (!/^\d$/.test(digit)) return match;
-      return modifier.toLowerCase() === 'double' ? digit + digit : digit + digit + digit;
-    });
+    let safeTranscript = ablated('normalizer') ? transcript : normalizeAcoustics(transcript);
 
     // ==========================================
     // PII PRIVACY SHIELD
@@ -401,18 +510,35 @@ export async function POST(request: Request) {
     const currentTurnPiiCount = piiVault.size - historyPiiCount;
     console.log(`[Privacy Shield] Masked: "${safeTranscript}" (${currentTurnPiiCount} item(s) masked this turn)`);
 
+    const llmMessages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history,
+      { role: "user", content: safeTranscript },
+    ];
+    const piiLeak = detectPiiLeak(llmMessages, piiVault);
+    if (piiLeak) console.warn("[Privacy Shield] Possible unmasked number in LLM payload");
+
     // ==========================================
     // PHASE 2: THE BRAIN, wrapped in a circuit breaker
     // ==========================================
     let aiResponse: AiResponse | null = null;
     let source: 'llm' | 'regex' | 'keyword' | 'none' = 'llm';
     let parseOk = false;
+    let llmRawTarget = "none";
     const breakerState = Date.now() < breakerOpenUntil ? 'open' : 'closed';
 
     if (breakerState === 'closed') {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
       try {
+        if (evalOpts.fault === 'timeout') {
+          await sleep(LLM_TIMEOUT_MS);
+          throw new Error(`[Eval fault] LLM timed out after ${LLM_TIMEOUT_MS}ms`);
+        }
+        if (evalOpts.fault === 'error') {
+          throw new Error("[Eval fault] Groq LLM API Failed (503)");
+        }
+
         const llmResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
           headers: {
@@ -421,11 +547,7 @@ export async function POST(request: Request) {
           },
           body: JSON.stringify({
             model: "openai/gpt-oss-20b",
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              ...history,
-              { role: "user", content: safeTranscript },
-            ],
+            messages: llmMessages,
             temperature: 0.1,
             max_completion_tokens: 512,
             reasoning_effort: "low",
@@ -439,17 +561,27 @@ export async function POST(request: Request) {
           throw new Error(`Groq LLM API Failed (${llmResponse.status}): ${errorText}`);
         }
 
-        const llmData = await llmResponse.json();
-        const content: string = llmData.choices?.[0]?.message?.content ?? "";
+        const llmData: { choices?: { message?: { content?: string } }[] } = await llmResponse.json();
+        let content: string = llmData.choices?.[0]?.message?.content ?? "";
         if (!content.trim()) {
           throw new Error("Groq LLM returned empty content");
         }
 
+        if (evalOpts.fault === 'malformed') {
+          // Schema drift: Markdown fence, trailing comma and a missing closing brace
+          content = "```json\n" + content.trim().replace(/\}\s*$/, "").replace(/"\s*$/, '",') + "\n```";
+        }
+
         consecutiveFailures = 0;
-        const result = parseLLMOutput(content);
+        const result = parseLLMOutput(content, !ablated('fallback'));
         aiResponse = result.response;
         parseOk = result.parseOk;
-        source = parseOk ? 'llm' : 'regex';
+        source = parseOk ? 'llm' : (aiResponse ? 'regex' : 'none');
+
+        if (aiResponse && evalOpts.fault === 'hallucinate' && aiResponse.type === 'navigation') {
+          aiResponse.target = HALLUCINATED_ROUTE;
+        }
+        llmRawTarget = aiResponse?.target ?? "none";
       } catch (err) {
         console.error("LLM call failed, using keyword fallback:", err);
         consecutiveFailures++;
@@ -466,7 +598,7 @@ export async function POST(request: Request) {
 
     // Fallback tier: LLM unavailable, breaker open, or output unusable
     if (!aiResponse || (aiResponse.type !== 'navigation' && aiResponse.type !== 'qa')) {
-      const local = keywordRouter(safeTranscript);
+      const local = ablated('fallback') ? null : keywordRouter(safeTranscript);
       if (local) {
         aiResponse = local;
         source = 'keyword';
@@ -494,7 +626,9 @@ export async function POST(request: Request) {
 
     if (aiResponse.type === 'navigation') {
       // 1. Deterministic closest-label extraction takes priority (prevents phone/Aadhaar swaps)
-      const { entities: labeled, claimedRawDigits } = extractLabeledEntities(safeTranscript, piiVault);
+      const { entities: labeled, claimedRawDigits } = ablated('labellock')
+        ? { entities: {} as Record<string, string>, claimedRawDigits: new Set<string>() }
+        : extractLabeledEntities(safeTranscript, piiVault);
       const finalEntities: Record<string, string> = { ...labeled };
       const usedValues = new Set(Object.values(finalEntities));
 
@@ -519,7 +653,7 @@ export async function POST(request: Request) {
     // ROUTE WHITELIST
     // ==========================================
     if (aiResponse.type === 'navigation') {
-      if (!ALLOWED_ROUTES.includes(aiResponse.target)) {
+      if (!ablated('whitelist') && !ALLOWED_ROUTES.includes(aiResponse.target)) {
         console.warn(`Blocked non-whitelisted target: "${aiResponse.target}"`);
         aiResponse = {
           type: "qa",
@@ -549,6 +683,8 @@ export async function POST(request: Request) {
       aiResponse.type,
       aiResponse.target,
       currentTurnPiiCount,
+      piiLeak,
+      evalOpts.enabled ? 'eval' : 'live',
     ]);
 
     return NextResponse.json({
@@ -557,6 +693,23 @@ export async function POST(request: Request) {
       target: aiResponse.target,
       answer: aiResponse.answer,
       entities: aiResponse.entities,
+      ...(evalOpts.enabled
+        ? {
+            eval: {
+              source,
+              parse_ok: parseOk,
+              breaker: breakerState,
+              llm_raw_target: llmRawTarget,
+              whisper_ms: whisperMs,
+              llm_ms: llmMs,
+              total_ms: totalMs,
+              pii_count: currentTurnPiiCount,
+              pii_leak: piiLeak,
+              ablate: [...evalOpts.ablate],
+              fault: evalOpts.fault,
+            },
+          }
+        : {}),
     });
 
   } catch (error) {

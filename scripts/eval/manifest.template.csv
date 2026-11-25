@@ -1,0 +1,11 @@
+clip_id,speaker_id,language,audio_file,reference_text,expected_type,expected_route,phone,aadhaar_no,ration_no,history_json,text_input
+c001,S01,en,clips/c001.webm,"I want to apply for a new ration card, my phone number is 9876 012 345 and Aadhaar is 4021 7788 9123",navigation,/services/apply-ration,9876012345,402177889123,,,
+c002,S01,en,clips/c002.webm,"Check my application status, mobile nine eight seven six zero one two three four five, ration card number 21 0045 7781",navigation,/services/status,9876012345,,2100457781,,
+c003,S02,bn,clips/c003.webm,"আমার আধার কার্ড রেশন কার্ডের সাথে লিঙ্ক করতে চাই, আধার নম্বর 5512 3344 0098, ফোন 9123 456 780",navigation,/services/link-aadhaar,9123456780,551233440098,,,"I want to link my Aadhaar card with my ration card, Aadhaar number 5512 3344 0098, phone 9123 456 780"
+c004,S02,bn-en,clips/c004.webm,"Amar ration card er status check korte chai, phone number double nine eight three four five six one two zero",navigation,/services/status,9983456120,,,,"I want to check my ration card status, phone number double nine eight three four five six one two zero"
+c005,S03,hi,clips/c005.webm,"मुझे नया राशन कार्ड बनवाना है, मेरा मोबाइल नंबर 8017 223 344 है",navigation,/services/apply-ration,8017223344,,,,"I want to make a new ration card, my mobile number is 8017 223 344"
+c006,S03,hi-en,clips/c006.webm,"Mera Aadhaar link karna hai ration card se, ration number 3300 1122 45 aur Aadhaar 6677 1200 3456",navigation,/services/link-aadhaar,,667712003456,3300112245,,"I want to link my Aadhaar with my ration card, ration number 3300 1122 45 and Aadhaar 6677 1200 3456"
+c007,S04,en,clips/c007.webm,What are the office hours?,qa,,,,,,
+c008,S04,bn-en,clips/c008.webm,Helpline number ta ki?,qa,,,,,,What is the helpline number?
+c009,S05,en,clips/c009.webm,Open the ration card services page,navigation,/services/ration-card,,,,,
+c010,S05,en,clips/c010.webm,"No, I meant apply for a new card",navigation,/services/apply-ration,,,,"[{""role"":""user"",""content"":""check my status""},{""role"":""assistant"",""content"":""Navigating to status""}]",
